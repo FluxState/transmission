@@ -1289,22 +1289,24 @@ void create_bit_torrent_peer(
         info->destroy_handshake();
     }
 
-    if (!result.is_connected || swarm == nullptr || !swarm->is_running)
+    if (swarm == nullptr || !swarm->is_running)
     {
-        if (info && !info->is_connected())
-        {
-            info->on_connection_failed();
+        return false;
+    }
 
-            if (!result.read_anything_from_peer)
-            {
-                tr_logAddTraceSwarm(
-                    swarm,
-                    fmt::format(
-                        "marking peer {} as unreachable... num_fails is {}",
-                        info->display_name(),
-                        info->connection_failure_count()));
-                info->set_connectable(false);
-            }
+    if (!result.is_connected && info && !info->is_connected())
+    {
+        info->on_connection_failed();
+
+        if (!result.read_anything_from_peer)
+        {
+            tr_logAddTraceSwarm(
+                swarm,
+                fmt::format(
+                    "marking peer {} as unreachable... num_fails is {}",
+                    info->display_name(),
+                    info->connection_failure_count()));
+            info->set_connectable(false);
         }
 
         return false;
