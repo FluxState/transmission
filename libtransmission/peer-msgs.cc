@@ -81,7 +81,7 @@ auto constexpr Piece = uint8_t{ 7 };
 auto constexpr Cancel = uint8_t{ 8 };
 
 // https://www.bittorrent.org/beps/bep_0005.html#bittorrent-protocol-extension
-auto constexpr Port = uint8_t{ 9 };
+auto constexpr DhtPort = uint8_t{ 9 };
 
 // https://www.bittorrent.org/beps/bep_0006.html
 auto constexpr FextSuggest = uint8_t{ 13 };
@@ -124,8 +124,8 @@ auto constexpr Ltep = uint8_t{ 20 };
         return "not-interested"sv;
     case Piece:
         return "piece"sv;
-    case Port:
-        return "port"sv;
+    case DhtPort:
+        return "dht-port"sv;
     case Request:
         return "request"sv;
     case Unchoke:
@@ -178,7 +178,7 @@ auto constexpr KeepaliveIntervalSecs = time_t{ 100 };
 
 auto constexpr MetadataReqQ = size_t{ 64U };
 
-auto constexpr ReqQ = 512;
+auto constexpr PeerReqQDefault = 500U;
 
 // when we're making requests from another peer,
 // batch them together to send enough requests to
@@ -332,7 +332,7 @@ public:
 
         if (session->allowsDHT() && io_->supports_dht())
         {
-            protocol_send_port(session->udpPort());
+            protocol_send_dht_port(session->udpPort());
         }
 
         io_->set_callbacks(can_read, did_write, got_error, this);
@@ -396,6 +396,12 @@ public:
     }
 
     // ---
+
+    void ban() override
+    {
+        peer_info->ban();
+        disconnect_soon();
+    }
 
     void on_torrent_got_metainfo() noexcept override
     {
@@ -571,6 +577,11 @@ private:
 
     void update_block_requests();
 
+    [[nodiscard]] constexpr auto client_reqq() const noexcept
+    {
+        return session->reqq();
+    }
+
     // ---
 
     [[nodiscard]] std::optional<int64_t> pop_next_metadata_request()
@@ -608,40 +619,40 @@ private:
 
     // ---
 
-    size_t protocol_send_keepalive() const;
+    size_t protocol_send_keepalive() const; // NOLINT(modernize-use-nodiscard)
 
     template<typename... Args>
     size_t protocol_send_message(uint8_t type, Args const&... args) const;
 
-    size_t protocol_send_reject(peer_request const& req) const
+    size_t protocol_send_reject(peer_request const& req) const // NOLINT(modernize-use-nodiscard)
     {
         TR_ASSERT(io_->supports_fext());
         return protocol_send_message(BtPeerMsgs::FextReject, req.index, req.offset, req.length);
     }
 
-    size_t protocol_send_cancel(peer_request const& req) const
+    size_t protocol_send_cancel(peer_request const& req) const // NOLINT(modernize-use-nodiscard)
     {
         return protocol_send_message(BtPeerMsgs::Cancel, req.index, req.offset, req.length);
     }
 
-    size_t protocol_send_request(peer_request const& req) const
+    size_t protocol_send_request(peer_request const& req) const // NOLINT(modernize-use-nodiscard)
     {
         TR_ASSERT(is_valid_request(req));
         return protocol_send_message(BtPeerMsgs::Request, req.index, req.offset, req.length);
     }
 
-    size_t protocol_send_port(tr_port const port) const
+    size_t protocol_send_dht_port(tr_port const port) const // NOLINT(modernize-use-nodiscard)
     {
-        return protocol_send_message(BtPeerMsgs::Port, port.host());
+        return protocol_send_message(BtPeerMsgs::DhtPort, port.host());
     }
 
-    size_t protocol_send_have(tr_piece_index_t const index) const
+    size_t protocol_send_have(tr_piece_index_t const index) const // NOLINT(modernize-use-nodiscard)
     {
         static_assert(sizeof(tr_piece_index_t) == sizeof(uint32_t));
         return protocol_send_message(BtPeerMsgs::Have, index);
     }
 
-    size_t protocol_send_choke(bool const choke) const
+    size_t protocol_send_choke(bool const choke) const // NOLINT(modernize-use-nodiscard)
     {
         return protocol_send_message(choke ? BtPeerMsgs::Choke : BtPeerMsgs::Unchoke);
     }
@@ -702,7 +713,7 @@ private:
 
     // if the peer supports the Extension Protocol in BEP 10 and
     // supplied a reqq argument, it's stored here.
-    std::optional<size_t> reqq_;
+    std::optional<size_t> peer_reqq_;
 
     std::unique_ptr<libtransmission::Timer> pex_timer_;
 
@@ -746,7 +757,7 @@ private:
         len -= sizeof(id) + sizeof(uint32_t /*piece*/) + sizeof(uint32_t /*offset*/);
         return len <= tr_block_info::BlockSize;
 
-    case BtPeerMsgs::Port:
+    case BtPeerMsgs::DhtPort:
         return len == 3U;
 
     case BtPeerMsgs::Ltep:
@@ -1131,9 +1142,8 @@ void tr_peerMsgsImpl::send_ltep_handshake()
 
     // https://www.bittorrent.org/beps/bep_0010.html
     // An integer, the number of outstanding request messages this
-    // client supports without dropping any. The default in in
-    // libtorrent is 250.
-    tr_variantDictAddInt(&val, TR_KEY_reqq, ReqQ);
+    // client supports without dropping any.
+    tr_variantDictAddInt(&val, TR_KEY_reqq, client_reqq());
 
     // https://www.bittorrent.org/beps/bep_0010.html
     // A string containing the compact representation of the ip address this peer sees
@@ -1289,7 +1299,7 @@ void tr_peerMsgsImpl::parse_ltep_handshake(MessageReader& payload)
     /* get peer's maximum request queue size */
     if (auto reqq_in = int64_t{}; tr_variantDictFindInt(&*var, TR_KEY_reqq, &reqq_in))
     {
-        reqq_ = reqq_in;
+        peer_reqq_ = reqq_in;
     }
 }
 
@@ -1367,7 +1377,7 @@ ReadResult tr_peerMsgsImpl::process_peer_message(uint8_t id, MessageReader& payl
                 static_cast<int>(id),
                 std::size(payload)));
         publish(tr_peer_event::GotError(EMSGSIZE));
-        return { READ_ERR, {} };
+        return { ReadState::Err, {} };
     }
 
     switch (id)
@@ -1410,7 +1420,7 @@ ReadResult tr_peerMsgsImpl::process_peer_message(uint8_t id, MessageReader& payl
         if (tor_.has_metainfo() && ui32 >= tor_.piece_count())
         {
             publish(tr_peer_event::GotError(ERANGE));
-            return { READ_ERR, {} };
+            return { ReadState::Err, {} };
         }
 
         /* a peer can send the same HAVE message twice... */
@@ -1468,7 +1478,7 @@ ReadResult tr_peerMsgsImpl::process_peer_message(uint8_t id, MessageReader& payl
     case BtPeerMsgs::Piece:
         return read_piece_data(payload);
 
-    case BtPeerMsgs::Port:
+    case BtPeerMsgs::DhtPort:
         // https://www.bittorrent.org/beps/bep_0005.html
         // Peers supporting the DHT set the last bit of the 8-byte reserved flags
         // exchanged in the BitTorrent protocol handshake. Peer receiving a handshake
@@ -1476,7 +1486,7 @@ ReadResult tr_peerMsgsImpl::process_peer_message(uint8_t id, MessageReader& payl
         // It begins with byte 0x09 and has a two byte payload containing the UDP
         // port of the DHT node in network byte order.
         {
-            logtrace(this, "Got a BtPeerMsgs::Port");
+            logtrace(this, "Got a BtPeerMsgs::DhtPort");
 
             auto const hport = payload.to_uint16();
             if (auto const dht_port = tr_port::from_host(hport); !std::empty(dht_port))
@@ -1498,7 +1508,7 @@ ReadResult tr_peerMsgsImpl::process_peer_message(uint8_t id, MessageReader& payl
         else
         {
             publish(tr_peer_event::GotError(EMSGSIZE));
-            return { READ_ERR, {} };
+            return { ReadState::Err, {} };
         }
 
         break;
@@ -1514,7 +1524,7 @@ ReadResult tr_peerMsgsImpl::process_peer_message(uint8_t id, MessageReader& payl
         else
         {
             publish(tr_peer_event::GotError(EMSGSIZE));
-            return { READ_ERR, {} };
+            return { ReadState::Err, {} };
         }
 
         break;
@@ -1530,7 +1540,7 @@ ReadResult tr_peerMsgsImpl::process_peer_message(uint8_t id, MessageReader& payl
         else
         {
             publish(tr_peer_event::GotError(EMSGSIZE));
-            return { READ_ERR, {} };
+            return { ReadState::Err, {} };
         }
 
         break;
@@ -1546,7 +1556,7 @@ ReadResult tr_peerMsgsImpl::process_peer_message(uint8_t id, MessageReader& payl
         else
         {
             publish(tr_peer_event::GotError(EMSGSIZE));
-            return { READ_ERR, {} };
+            return { ReadState::Err, {} };
         }
 
         break;
@@ -1565,7 +1575,7 @@ ReadResult tr_peerMsgsImpl::process_peer_message(uint8_t id, MessageReader& payl
             else
             {
                 publish(tr_peer_event::GotError(EMSGSIZE));
-                return { READ_ERR, {} };
+                return { ReadState::Err, {} };
             }
 
             break;
@@ -1581,7 +1591,7 @@ ReadResult tr_peerMsgsImpl::process_peer_message(uint8_t id, MessageReader& payl
         break;
     }
 
-    return { READ_NOW, {} };
+    return { ReadState::Now, {} };
 }
 
 ReadResult tr_peerMsgsImpl::read_piece_data(MessageReader& payload)
@@ -1600,13 +1610,13 @@ ReadResult tr_peerMsgsImpl::read_piece_data(MessageReader& payload)
     if (loc.block_offset + len > block_size)
     {
         logwarn(this, fmt::format("got unaligned piece {:d}:{:d}->{:d}", piece, offset, len));
-        return { READ_ERR, len };
+        return { ReadState::Err, len };
     }
 
     if (!tr_peerMgrDidPeerRequest(&tor_, this, block))
     {
         logwarn(this, fmt::format("got unrequested piece {:d}:{:d}->{:d}", piece, offset, len));
-        return { READ_ERR, len };
+        return { ReadState::Err, len };
     }
 
     publish(tr_peer_event::GotPieceData(len));
@@ -1616,7 +1626,7 @@ ReadResult tr_peerMsgsImpl::read_piece_data(MessageReader& payload)
         auto buf = std::make_unique<Cache::BlockData>(block_size);
         payload.to_buf(std::data(*buf), len);
         auto const ok = client_got_block(std::move(buf), block) == 0;
-        return { ok ? READ_NOW : READ_ERR, len };
+        return { ok ? ReadState::Now : ReadState::Err, len };
     }
 
     auto& blocks = incoming_.blocks;
@@ -1625,18 +1635,18 @@ ReadResult tr_peerMsgsImpl::read_piece_data(MessageReader& payload)
 
     if (!incoming_block.add_span(loc.block_offset, loc.block_offset + len))
     {
-        return { READ_ERR, len }; // invalid span
+        return { ReadState::Err, len }; // invalid span
     }
 
     if (!incoming_block.has_all())
     {
-        return { READ_LATER, len }; // we don't have the full block yet
+        return { ReadState::Later, len }; // we don't have the full block yet
     }
 
     auto block_buf = std::move(incoming_block.buf);
     blocks.erase(block); // note: invalidates `incoming_block` local
     auto const ok = client_got_block(std::move(block_buf), block) == 0;
-    return { ok ? READ_NOW : READ_ERR, len };
+    return { ok ? ReadState::Now : ReadState::Err, len };
 }
 
 // returns 0 on success, or an errno on failure
@@ -1678,7 +1688,6 @@ int tr_peerMsgsImpl::client_got_block(std::unique_ptr<Cache::BlockData> block_da
         return err;
     }
 
-    blame.set(loc.piece);
     publish(tr_peer_event::GotBlock(tor_.block_info(), block));
 
     return 0;
@@ -1720,7 +1729,7 @@ ReadState tr_peerMsgsImpl::can_read(tr_peerIo* io, void* vmsgs, size_t* piece)
         auto message_len = uint32_t{};
         if (io->read_buffer_size() < sizeof(message_len))
         {
-            return READ_LATER;
+            return ReadState::Later;
         }
 
         io->read_uint32(&message_len);
@@ -1731,7 +1740,7 @@ ReadState tr_peerMsgsImpl::can_read(tr_peerIo* io, void* vmsgs, size_t* piece)
         if (message_len == 0U)
         {
             logtrace(msgs, "got KeepAlive");
-            return READ_NOW;
+            return ReadState::Now;
         }
 
         current_message_len = message_len;
@@ -1744,7 +1753,7 @@ ReadState tr_peerMsgsImpl::can_read(tr_peerIo* io, void* vmsgs, size_t* piece)
         auto message_type = uint8_t{};
         if (io->read_buffer_size() < sizeof(message_type))
         {
-            return READ_LATER;
+            return ReadState::Later;
         }
 
         io->read_uint8(&message_type);
@@ -1763,7 +1772,7 @@ ReadState tr_peerMsgsImpl::can_read(tr_peerIo* io, void* vmsgs, size_t* piece)
 
     if (n_left > 0U)
     {
-        return READ_LATER;
+        return ReadState::Later;
     }
 
     // The incoming message is now complete. After processing the message
@@ -1994,7 +2003,7 @@ bool tr_peerMsgsImpl::is_valid_request(peer_request const& req) const
         return false;
     }
 
-    if (std::size(peer_requested_) >= ReqQ)
+    if (std::size(peer_requested_) >= client_reqq())
     {
         logtrace(this, "rejecting request ... reqq is full");
         return false;
@@ -2045,7 +2054,7 @@ size_t tr_peerMsgsImpl::max_available_reqs() const
     static auto constexpr Floor = size_t{ 32 };
     static size_t constexpr Seconds = RequestBufSecs;
     size_t const estimated_blocks_in_period = (rate.base_quantity() * Seconds) / tr_block_info::BlockSize;
-    auto const ceil = reqq_.value_or(250);
+    auto const ceil = peer_reqq_.value_or(PeerReqQDefault);
 
     return std::clamp(estimated_blocks_in_period, Floor, ceil);
 }
